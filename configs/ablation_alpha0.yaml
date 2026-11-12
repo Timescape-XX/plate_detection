@@ -1,0 +1,65 @@
+data:
+  root: data/CCPD2019
+  # splits built by tools/make_splits.py (see REPORT.md § 2.2)
+  train_split: data/CCPD2019/splits/train_mix.txt   # ccpd_base train + 85% of the non-base pool
+  val_split: data/CCPD2019/splits/val_mix.txt       # 皖-dominated slice + non-皖 slice
+  val_limit: null
+  aug:
+    max_rotate: 6.0
+    scale_ratio: [0.85, 1.15]
+    translate: 0.02
+    perspective_prob: 0.3
+    perspective_jitter: 0.02
+    color_prob: 0.8
+    blur_prob: 0.15
+
+model:
+  input_h: 320          # letterbox canvas (CCPD is 720x1160 -> nearly lossless here)
+  input_w: 512
+  stride: 8             # detector grid: 40 x 64
+  crop_h: 32            # rectified plate crop fed to the recogniser
+  crop_w: 96
+  width: 1.0            # backbone channel multiplier
+
+loss:
+  cls_weight: 1.0
+  giou_weight: 1.0
+  corner_weight: 0.5
+  ctc_weight: 1.0
+  ctc_gt_weight: 0.5
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+
+train:
+  epochs: 8
+  batch_size: 32
+  lr: 0.0012
+  weight_decay: 0.0001
+  warmup_steps: 1000
+  grad_clip: 5.0
+  amp: bf16
+  workers: 6
+  seed: 42
+  log_every: 50
+  val_every: 2000
+  val_batches: null      # validate on the whole val_mix (4 932 images, ~5 s)
+  # ---- province re-balancing (lpr/sampling.py) --------------------------------
+  # alpha=0 reproduces CCPD's natural 92.7%-皖 prior, alpha=1 is uniform.
+  # 0.7 keeps 皖 at a meaningful share while giving the other 30 provinces
+  # enough batch mass to actually be learned.
+  sampling:
+    province_alpha: 0.0
+    province_floor: 32
+    weight_cap: 0
+    num_samples: null    # null -> one "epoch" = len(train pool) draws
+    folder_repeat:       # extra passes over the auxiliary sub-directories
+      ccpd_base: 1.0
+      ccpd_blur: 1.4
+      ccpd_challenge: 1.4
+      ccpd_db: 1.4
+      ccpd_fn: 1.4
+      ccpd_rotate: 1.4
+      ccpd_tilt: 1.4
+      ccpd_weather: 1.4
+
+output_dir: runs/ctrl_a0

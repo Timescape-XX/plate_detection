@@ -23,7 +23,7 @@
 
 ## 数据集核查结论（先做的一步）
 
-`tools/check_dataset.py` 对全部 355,013 个文件做了逐项校验，结论是 **数据完整，没有缺失**：
+`tools/audit_dataset.py` 对全部 355,013 个文件做了逐项校验，结论是 **数据完整，没有缺失**：
 
 | 项目 | 结果 |
 |---|---|
@@ -32,19 +32,24 @@
 | 截断 / 无法解码的图片 | **0**（抽样 800 张完整解码，全部 720×1160） |
 | 重复路径 | 0 |
 | ccpd_base 引用覆盖率 | 199,996 / 199,996（100%） |
+| `ccpd_base/ccpd_base/` 嵌套目录 | **已消除**（所有子目录现在都是 `{sub}/*.jpg` 平铺） |
 
-以下是三个需要知道的“非缺失”事实，不影响训练：
+两点仍需知道：
 
-1. `ccpd_base/` 多套了一层（实际在 `ccpd_base/ccpd_base/*.jpg`），dataloader 已自动兼容。
-2. `ccpd_np/` 有 **15 个 4 KB 的 macOS AppleDouble 垃圾文件**（magic `00 05 16 07`，开头是
+1. `ccpd_np/` 有 **15 个 4 KB 的 macOS AppleDouble 垃圾文件**（magic `00 05 16 07`，开头是
    `Mac OS X`），它们不是图片。该目录本身没有标注（文件名是纯数字），也不在任何 split 里。
-3. `ccpd_weather/`（9,999 张，带完整标注）和 `ccpd_np/`（3,036 张，无标注）**不在官方 split 文件里**。
-   weather 可以当额外训练数据用，np 只能当负样本。
+2. `ccpd_weather/`（9,999 张，带完整标注）和 `ccpd_np/`（3,036 张，无标注）**不在官方 split 文件里**。
+   weather 已并入 `train_mix`，np 只能当负样本。
+
+> `lpr/ccpd.py::resolve_split` 里原先有一段「路径不存在就再试一层 `root/sub/sub/`」的兜底逻辑，
+> 已随嵌套目录的修复一并删除：它会把「根目录指错 / split 写错 / 文件真缺失」三种故障
+> 静默变成「样本数变少」。现在缺失即抛异常，并提示去跑 `tools/audit_dataset.py`。
 
 复现（命令均在**仓库根目录**执行，`algo/` 下）：
 
 ```bash
-python plate_detection/tools/check_dataset.py --sample 2000
+python plate_detection/tools/audit_dataset.py           # 全量审计，约 11 s
+python plate_detection/tools/make_splits.py             # 重建 train_mix / val_* / test_*
 ```
 
 ## 目录结构
@@ -145,12 +150,12 @@ python plate_detection/train.py --max-steps 800 --batch-size 32 --train-limit 80
 python plate_detection/train.py --resume runs/smoke_fix/checkpoints/last.pth \
                 --output-dir runs/smoke_fix
 
-# 4) 评测
-python plate_detection/evaluate.py --weights runs/smoke_fix/checkpoints/best.pth --split val --limit 5000
+# 4) 评测（推荐权重 = 省份均衡重训版）
+python plate_detection/evaluate.py --weights runs/plate_bal/checkpoints/best.pth --split val --limit 5000
 
 # 5) 推理（单图或文件夹），结果画框存到 plate_detection/runs/pred
-python plate_detection/predict.py --weights runs/smoke_fix/checkpoints/best.pth --source test.jpg
-python plate_detection/predict.py --weights runs/smoke_fix/checkpoints/best.pth \
+python plate_detection/predict.py --weights runs/plate_bal/checkpoints/best.pth --source test.jpg
+python plate_detection/predict.py --weights runs/plate_bal/checkpoints/best.pth \
                                   --source some_dir/ --out runs/pred
 ```
 
@@ -159,13 +164,25 @@ python plate_detection/predict.py --weights runs/smoke_fix/checkpoints/best.pth 
 全都找不到时退回 OpenCV 字体并打印告警（此时省份汉字会缺失），也可以显式指定：
 
 ```bash
-python plate_detection/predict.py --weights runs/smoke_fix/checkpoints/best.pth \
+python plate_detection/predict.py --weights runs/plate_bal/checkpoints/best.pth \
     --source test.jpg --font "/System/Library/Fonts/Hiragino Sans GB.ttc"
 ```
 
-## 实测结果（800 步冒烟，仅见 25.6 k 样本 ≈ 0.26 epoch）
+## 实测结果
 
-`runs/smoke_fix`，val 512 张，IoU>0.7 计检出：
+### 当前推荐权重：`runs/plate_bal/checkpoints/best.pth`（8 epoch，1.72 M 样本）
+
+三个测试集上的端到端整牌准确率（IoU≥0.7 计检出）：
+
+| split | 构成 | 整牌 acc | 非皖 acc | 皖误报率 | CER |
+|---|---|---:|---:|---:|---:|
+| `test_prov` | 31 省均衡诊断集 | **82.0%** | 82.2% | 1.9% | 4.3% |
+| `val_base` | ccpd_base 自然先验 | **98.2%** | 98.1% | 0.0% | 0.39% |
+| `test_mix` | 非 base 难例池 | **74.3%** | 78.6% | 2.3% | 7.0% |
+
+### 历史：800 步冒烟（`runs/smoke_fix`，仅见 25.6 k 样本 ≈ 0.26 epoch）
+
+val 512 张，IoU>0.7 计检出：
 
 | step | loss | IoU | 检出率 | 端到端准确率 | CER |
 |---|---|---|---|---|---|
@@ -175,8 +192,8 @@ python plate_detection/predict.py --weights runs/smoke_fix/checkpoints/best.pth 
 | 600 | 2.57 | 0.822 | 94.5% | 30.3% | 0.148 |
 | 800 | 1.92 | 0.863 | 98.1% | **57.0%** | **0.078** |
 
-趋势明确：检测先收敛（边框任务简单），识别随后跟上。完整 12 epoch 有望把端到端准确率推到
-0.85+（RPnet 论文在 CCPD 上报 99.3% 检测 / 94.7% 识别，但其骨干与输入分辨率都比这里大一个量级）。
+这个冒烟权重在省份均衡测试集上只有 **1.9%** 整牌准确率、**93%** 的非皖车牌被判成「皖」——
+它就是触发本次重训的那个基线，详见 `REPORT.md` §2.6。
 
 推理样例见 `runs/demo_out/`（含 tilt/rotate/fn 子集样本），`runs/sanity/` 可看数据管线验收图。
 
@@ -200,10 +217,36 @@ python plate_detection/predict.py --weights runs/smoke_fix/checkpoints/best.pth 
 ## 已知限制
 
 - 只支持单块车牌：没有 NMS，argmax 只取一个格子。多车牌场景需要改成 top-k + NMS。
-- 训练集只有 `splits/train.txt`（ccpd_base）。想提升 blur/fn/weather 的鲁棒性，可以把
-  `ccpd_weather` 或 test 子集并进训练（改 `build_loader` 的 split 参数即可）。
+- **省份长尾已修正，但未根治**：官方 `train.txt` 里非皖只有 4,106 张（每省 137 张）。
+  `configs/balanced.yaml` 的逆频率重采样把非皖整牌准确率从 0.2% 提到 82.2%，剩下的错误集中在
+  「字形相近的省份汉字」（冀/闽、蒙/豫），属于分辨率问题而非分布问题。
 - 不含车牌颜色/类型（蓝牌/绿牌/黄牌）分类。
 - CTC 贪心解码，没有语言模型或约束解码；7/8 位车牌的位次约束可以进一步降 CER。
+
+## 省份长尾修正（2026-11 重训）
+
+`train.py` 默认的 `configs/default.yaml` 仍复现历史行为（只在 `splits/train.txt` 上训练）。
+修正版用另一套 split 与采样策略：
+
+```bash
+python plate_detection/tools/make_splits.py          # 生成 train_mix / val_base / val_mix / test_prov / test_mix
+python plate_detection/train.py --config plate_detection/configs/balanced.yaml
+python plate_detection/tools/eval_suite.py --weights runs/plate_bal/checkpoints/best.pth --name new_bal
+```
+
+关键点：**只把 blur/challenge/db/fn/rotate/tilt 加进训练是不够的**——这些子目录本身就有
+83–96% 是皖。真正起作用的是按省份逆频率重采样（`lpr/sampling.py`），把 batch 里皖的占比
+从 92.7% 压到 19.8%，同时给辅助子目录 1.4× 的重复因子。
+
+等预算消融（同数据池、同 12 000 步，只改 α）：
+
+| 设置 | `test_prov` 整牌 | 非皖 acc | 皖误报 | `val_base`（皖主导） |
+|---|---:|---:|---:|---:|
+| α=0（自然先验） | 32.9% | 30.0% | 30.6% | 97.5% |
+| α=0.7（重采样） | **67.4%** | **67.6%** | **4.0%** | 96.0% |
+
+也就是说分布效应本身是 2.0×，代价是皖主导集上 1.5 个点。数学推导、逐省/逐位分析与全部
+实验数据见 `REPORT.md`。
 
 ## 参考
 

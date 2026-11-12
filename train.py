@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 import yaml
 
-from lpr.ccpd import build_loader
+from lpr.ccpd import build_loader, build_train_loader
 from lpr.evaluate import run_eval
 from lpr.loss import PlateLoss
 from lpr.model import PlateNet
@@ -72,6 +72,9 @@ def main() -> int:
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--max-steps", type=int, default=None, help="stop after N optimizer steps (smoke test)")
+    ap.add_argument("--max-epochs", type=int, default=None,
+                    help="stop after N epochs while keeping the full cosine horizon "
+                         "(used for the equal-budget α=0 control run)")
     ap.add_argument("--train-limit", type=int, default=None)
     ap.add_argument("--val-limit", type=int, default=None)
     ap.add_argument("--workers", type=int, default=None)
@@ -83,6 +86,8 @@ def main() -> int:
     ap.add_argument("--resume", default=None)
     ap.add_argument("--output-dir", default=None)
     ap.add_argument("--tag", default=None, help="suffix for the run directory")
+    ap.add_argument("--alpha", type=float, default=None,
+                    help="override train.sampling.province_alpha (0=natural prior, 1=uniform)")
     ap.add_argument("--no-val", action="store_true")
     args = ap.parse_args()
 
@@ -124,9 +129,13 @@ def main() -> int:
         torch.backends.cudnn.benchmark = True
 
     input_hw = (mc["input_h"], mc["input_w"])
-    train_loader = build_loader(
-        dc["root"], dc["train_split"], batch_size=batch_size, train=True,
-        input_hw=input_hw, workers=workers, limit=args.train_limit, seed=tc["seed"],
+    sampling = dict(tc.get("sampling") or {})
+    if args.alpha is not None:
+        sampling["province_alpha"] = args.alpha
+    train_loader, plan = build_train_loader(
+        dc["root"], dc["train_split"], batch_size=batch_size,
+        input_hw=input_hw, workers=workers, limit=args.train_limit,
+        sampling=sampling or None,
         max_rotate=dc["aug"]["max_rotate"], scale_ratio=tuple(dc["aug"]["scale_ratio"]),
         translate=dc["aug"]["translate"], perspective_prob=dc["aug"]["perspective_prob"],
         perspective_jitter=dc["aug"]["perspective_jitter"], color_prob=dc["aug"]["color_prob"],
@@ -162,9 +171,22 @@ def main() -> int:
           f"train={len(train_loader.dataset)} val={len(val_loader.dataset) if val_loader else 0} "
           f"steps/epoch={steps_per_epoch} total_steps={total_steps} bs={batch_size} "
           f"input={input_hw} amp={tc.get('amp')}", flush=True)
+    if plan is not None:
+        print(plan.summary(), flush=True)
+        (out_dir / "sampling_plan.json").write_text(json.dumps({
+            "alpha": plan.alpha,
+            "province_natural": plan.natural,
+            "province_effective": plan.effective,
+            "folder_effective": plan.folder_effective,
+            "config": sampling,
+        }, indent=2, ensure_ascii=False), encoding="utf-8")
+    else:
+        print("[sampler] uniform shuffling over the natural prior", flush=True)
 
     start_step = 0
     best_acc = -1.0
+    best_macro = -1.0
+    val_history: list[dict] = []
     if args.resume:
         resume_path = resolve_path(args.resume)
         ckpt = torch.load(str(resume_path), map_location=device, weights_only=False)
@@ -179,7 +201,8 @@ def main() -> int:
     writer = csv.writer(log_file)
     if log_path.stat().st_size == 0:
         writer.writerow(["step", "epoch", "lr", "loss", "cls", "giou", "corner", "ctc", "ctc_gt",
-                         "sec_per_step", "val_iou", "val_det_rate", "val_plate_acc", "val_cer"])
+                         "sec_per_step", "val_iou", "val_det_rate", "val_plate_acc", "val_cer",
+                         "val_wan_fp", "val_macro_head"])
 
     model.train()
     step = start_step
@@ -235,7 +258,7 @@ def main() -> int:
 
                 step += 1
                 for k in running:
-                    running[k] += float(losses[k])
+                    running[k] += float(losses[k].detach())
                 running_n += 1
 
                 if step % log_every == 0 or step == total_steps:
@@ -255,24 +278,50 @@ def main() -> int:
 
                 if val_loader is not None and (step % val_every == 0 or step == total_steps):
                     metrics = run_eval(model, val_loader, device, max_batches=val_batches)
-                    print(f"[val  ] step {step} " + format_metrics(metrics), flush=True)
+                    print(f"[val  ] step {step} " + format_metrics(metrics)
+                          + f" wan_fp={metrics.get('wan_fp_rate', 0):.3f}"
+                          + f" macro_head={metrics.get('macro_acc_nonwan_head', 0):.3f}", flush=True)
                     print(f"        examples: {[(e['pred'], e['gt']) for e in metrics['examples'][:4]]}", flush=True)
                     writer.writerow([step, epoch, f"{cur_lr:.6f}", "", "", "", "", "", "", "",
                                      f"{metrics['iou']:.5f}", f"{metrics['det_rate']:.5f}",
-                                     f"{metrics['plate_acc']:.5f}", f"{metrics['cer']:.5f}"])
+                                     f"{metrics['plate_acc']:.5f}", f"{metrics['cer']:.5f}",
+                                     f"{metrics.get('wan_fp_rate', 0):.5f}",
+                                     f"{metrics.get('macro_acc_nonwan_head', 0):.5f}"])
                     log_file.flush()
                     acc = metrics["plate_acc"]
                     if acc > best_acc:
                         best_acc = acc
                         save("best.pth", metrics)
                         print(f"[ckpt ] best.pth (plate_acc={acc:.4f})", flush=True)
+                    macro = metrics.get("macro_acc_nonwan_head", 0.0)
+                    if macro > best_macro:
+                        best_macro = macro
+                        save("best_nonwan.pth", metrics)
+                        print(f"[ckpt ] best_nonwan.pth (macro_head={macro:.4f})", flush=True)
                     model.train()
                     save("last.pth", metrics)
+                    val_history.append({
+                        "step": step, "epoch": epoch,
+                        "iou": metrics["iou"], "det_rate": metrics["det_rate"],
+                        "plate_acc": metrics["plate_acc"], "cer": metrics["cer"],
+                        "wan_fp_rate": metrics.get("wan_fp_rate", 0.0),
+                        "macro_acc_nonwan_head": metrics.get("macro_acc_nonwan_head", 0.0),
+                        "by_province": metrics.get("by_province", {}),
+                    })
                 elif step == total_steps:
                     save("last.pth")
 
                 if step >= total_steps:
                     break
+            # one full pass over the (re-weighted) pool: keep it for the curve plot
+            if step < total_steps and (args.max_epochs is None or epoch < args.max_epochs):
+                save(f"epoch_{epoch:02d}.pth")
+                print(f"[epoch] {epoch} done @ step {step}", flush=True)
+            if args.max_epochs is not None and epoch >= args.max_epochs:
+                print(f"[stop] reached --max-epochs {args.max_epochs} @ step {step}, "
+                      f"saving last.pth", flush=True)
+                save("last.pth")
+                break
     except KeyboardInterrupt:
         print("[stop] interrupted, saving last.pth", flush=True)
         save("last.pth")
@@ -291,8 +340,13 @@ def main() -> int:
         "peak_allocated_mb": round(peak_mb, 1),
         "peak_reserved_mb": round(peak_reserved, 1),
         "best_plate_acc": best_acc,
+        "best_macro_nonwan_head": best_macro,
+        "sampling_alpha": sampling.get("province_alpha"),
     }
     (out_dir / "train_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    if val_history:
+        (out_dir / "val_history.json").write_text(
+            json.dumps(val_history, indent=2, ensure_ascii=False), encoding="utf-8")
     print("[done] " + json.dumps(summary), flush=True)
     return 0
 

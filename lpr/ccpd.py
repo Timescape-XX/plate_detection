@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from .charset import decode_label_indices
 from .geometry import order_quad
+from .sampling import folder_of, province_of
 
 cv2.setNumThreads(0)
 
@@ -55,28 +56,35 @@ def parse_ccpd_name(name: str) -> Dict:
     }
 
 
-def resolve_split(root: Path, split_file: str | Path) -> List[str]:
-    """Read a split file and return paths that exist (handles the nested
-    ``ccpd_base/ccpd_base/`` layout of this dataset copy)."""
+def resolve_split(root: Path, split_file: str | Path, strict: bool = True) -> List[str]:
+    """Read a split file and return the absolute paths that exist on disk.
+
+    Historically this dataset copy had ``ccpd_base/ccpd_base/*.jpg`` and the
+    loader silently retried a nested path when the plain one missed.  That kind
+    of silent recovery is exactly how a wrong ``--data-root`` survives for weeks,
+    so it is gone: a missing entry now raises (``tools/audit_dataset.py`` reports
+    the whole picture up front).
+    """
     lines = [
         ln.strip()
         for ln in Path(split_file).read_text(encoding="utf-8", errors="replace").splitlines()
         if ln.strip() and not ln.startswith("#")
     ]
     out: List[str] = []
+    missing: List[str] = []
     for rel in lines:
         p = root / rel
-        if not p.is_file():
-            parts = Path(rel).parts
-            if len(parts) >= 2:
-                alt = root / parts[0] / parts[0] / Path(*parts[1:])
-                if alt.is_file():
-                    p = alt
-                else:
-                    continue
-            else:
-                continue
-        out.append(str(p))
+        if p.is_file():
+            out.append(str(p))
+        else:
+            missing.append(rel)
+    if missing:
+        msg = (f"{len(missing)}/{len(lines)} paths from {Path(split_file).name} do not exist "
+               f"under {root}\n  e.g. {missing[:3]}\n"
+               f"  run  python tools/audit_dataset.py  for a full report")
+        if strict:
+            raise FileNotFoundError(msg)
+        print(f"[warn] {msg}")
     return out
 
 
@@ -101,6 +109,7 @@ class CCPDDataset(Dataset):
         color_prob: float = 0.8,
         blur_prob: float = 0.15,
         skip_broken: bool = True,
+        strict: bool = True,
     ) -> None:
         self.root = Path(root)
         self.input_h, self.input_w = int(input_hw[0]), int(input_hw[1])
@@ -114,7 +123,7 @@ class CCPDDataset(Dataset):
         self.blur_prob = blur_prob
         self.skip_broken = skip_broken
 
-        files = resolve_split(self.root, split_file)
+        files = resolve_split(self.root, split_file, strict=strict)
         if shuffle:
             random.Random(seed).shuffle(files)
         if limit is not None:
@@ -213,6 +222,8 @@ class CCPDDataset(Dataset):
             "target": torch.tensor(ann["labels"], dtype=torch.long),
             "text": ann["text"],
             "path": path,
+            "province": province_of(path),
+            "folder": folder_of(path),
         }
 
 
@@ -229,7 +240,57 @@ def ctc_collate(batch: List[Dict]) -> Dict:
         "target_lengths": lengths,
         "texts": [b["text"] for b in batch],
         "paths": [b["path"] for b in batch],
+        "provinces": [b["province"] for b in batch],
+        "folders": [b["folder"] for b in batch],
     }
+
+
+def build_train_loader(
+    root: str | Path,
+    split_file: str | Path,
+    batch_size: int,
+    input_hw: Sequence[int] = (320, 512),
+    workers: int = 4,
+    limit: int | None = None,
+    sampling: dict | None = None,
+    **aug_kwargs,
+) -> tuple[DataLoader, "SamplingPlan | None"]:
+    """Training loader with optional province-balanced sampling.
+
+    Returns the loader *and* the :class:`SamplingPlan` so the caller can log / dump
+    the effective province distribution actually being optimised.
+    """
+    from torch.utils.data import DataLoader as _DL
+    from torch.utils.data import WeightedRandomSampler
+
+    from .sampling import build_sampling_plan
+
+    ds = CCPDDataset(root, split_file, input_hw=input_hw, train=True, limit=limit, **aug_kwargs)
+    plan = None
+    sampler = None
+    if sampling:
+        plan = build_sampling_plan(
+            ds.files,
+            alpha=float(sampling.get("province_alpha", 0.0)),
+            folder_repeat=sampling.get("folder_repeat") or {},
+            province_floor=int(sampling.get("province_floor", 32)),
+            weight_cap=float(sampling.get("weight_cap", 24.0)),
+        )
+        if sampling.get("province_alpha", 0.0) > 0 or sampling.get("folder_repeat"):
+            num_samples = int(sampling.get("num_samples") or len(ds))
+            sampler = WeightedRandomSampler(
+                torch.as_tensor(plan.weights, dtype=torch.double),
+                num_samples=num_samples,
+                replacement=True,
+            )
+    loader = _DL(
+        ds, batch_size=batch_size, sampler=sampler,
+        shuffle=sampler is None,
+        num_workers=workers, pin_memory=True, drop_last=len(ds) > batch_size,
+        collate_fn=ctc_collate, persistent_workers=workers > 0,
+        prefetch_factor=4 if workers > 0 else None,
+    )
+    return loader, plan
 
 
 def build_loader(
@@ -241,9 +302,19 @@ def build_loader(
     workers: int = 4,
     limit: int | None = None,
     seed: int = 0,
+    sampler: torch.utils.data.Sampler | None = None,
+    strict: bool = True,
     **kwargs,
 ) -> DataLoader:
-    ds = CCPDDataset(root, split_file, input_hw=input_hw, train=train, limit=limit, **kwargs)
+    ds = CCPDDataset(root, split_file, input_hw=input_hw, train=train, limit=limit,
+                     strict=strict, **kwargs)
+    if sampler is not None:
+        # a sampler decides the sampling *distribution*; shuffle would fight it
+        return DataLoader(
+            ds, batch_size=batch_size, sampler=sampler, num_workers=workers,
+            pin_memory=True, drop_last=len(ds) > batch_size, collate_fn=ctc_collate,
+            persistent_workers=workers > 0, prefetch_factor=4 if workers > 0 else None,
+        )
     return DataLoader(
         ds,
         batch_size=batch_size,

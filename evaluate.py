@@ -1,7 +1,12 @@
 """Evaluate a checkpoint on a CCPD split.
 
-    python plate_detection/evaluate.py --weights runs/smoke_fix/checkpoints/best.pth \
-                                       --split val --limit 5000
+    python plate_detection/evaluate.py --weights runs/plate_bal/checkpoints/best.pth \
+                                       --split test_prov --limit 5000
+
+``--split`` is any stem under ``data/CCPD2019/splits/`` (val / test / val_base /
+test_prov / test_mix / ...).  The output includes a per-province breakdown: on a
+92 %-皖 split the aggregate accuracy hides exactly the failure mode this project
+is about.  For a full before/after comparison use ``tools/eval_suite.py``.
 """
 from __future__ import annotations
 
@@ -23,7 +28,8 @@ from predict import load_model  # noqa: E402  (shares the checkpoint-loading log
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", required=True)
-    ap.add_argument("--split", default="val", choices=["val", "test"])
+    ap.add_argument("--split", default="val",
+                    help="split stem under data/CCPD2019/splits (val, test, val_base, test_prov, ...)")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--max-batches", type=int, default=None)
@@ -49,7 +55,8 @@ def main() -> int:
                           input_hw=(model.input_h, model.input_w), workers=args.workers,
                           limit=args.limit)
     metrics = run_eval(model, loader, device, max_batches=args.max_batches)
-    print(json.dumps({k: v for k, v in metrics.items() if k != "examples"}, indent=2))
+    print(json.dumps({k: v for k, v in metrics.items() if k != "examples"},
+                     indent=2, ensure_ascii=False))
     print("examples:", [(e["pred"], e["gt"], round(e["iou"], 3)) for e in metrics["examples"]])
     return 0
 
