@@ -1,0 +1,9 @@
+# Python 3.9+（锁定版本，保证跨机可复现；测试于 Python 3.9.6 + PyTorch 2.8.0）
+# RTX 50-series (Blackwell, sm_120) needs a cu128+ build of torch:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0
+numpy==2.0.2
+opencv-python-headless==4.10.0.84
+pillow==10.4.0
+pyyaml==6.0.2
+tqdm==4.67.1
