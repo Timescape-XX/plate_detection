@@ -27,6 +27,10 @@ python tools/audit_dataset.py           # 全量审计，约 11 s
 python tools/make_splits.py             # 重建 train_mix / val_* / test_*
 ```
 
+## 预训练权重
+
+checkpoint 下载：[Google Drive](https://drive.google.com/file/d/1Y4A1yz6jKJmH5kXJx9Y8fOOVsxqNjelj/view?usp=sharing)
+
 ## 目录结构
 
 ```
