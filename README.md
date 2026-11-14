@@ -21,35 +21,10 @@
 检测与识别共享同一次前向，透视变换可微 —— 识别损失会把梯度回传给检测头，
 因此端到端联合训练（不需要 CPU 裁剪，也不需要两套模型）。
 
-## 数据集核查结论（先做的一步）
-
-`tools/audit_dataset.py` 对全部 355,013 个文件做了逐项校验，结论是 **数据完整，没有缺失**：
-
-| 项目 | 结果 |
-|---|---|
-| splits 中列出的路径总数 | 341,978（train 100,000 / val 99,996 / test 141,982） |
-| 磁盘上不存在的条目 | **0** |
-| 截断 / 无法解码的图片 | **0**（抽样 800 张完整解码，全部 720×1160） |
-| 重复路径 | 0 |
-| ccpd_base 引用覆盖率 | 199,996 / 199,996（100%） |
-| `ccpd_base/ccpd_base/` 嵌套目录 | **已消除**（所有子目录现在都是 `{sub}/*.jpg` 平铺） |
-
-两点仍需知道：
-
-1. `ccpd_np/` 有 **15 个 4 KB 的 macOS AppleDouble 垃圾文件**（magic `00 05 16 07`，开头是
-   `Mac OS X`），它们不是图片。该目录本身没有标注（文件名是纯数字），也不在任何 split 里。
-2. `ccpd_weather/`（9,999 张，带完整标注）和 `ccpd_np/`（3,036 张，无标注）**不在官方 split 文件里**。
-   weather 已并入 `train_mix`，np 只能当负样本。
-
-> `lpr/ccpd.py::resolve_split` 里原先有一段「路径不存在就再试一层 `root/sub/sub/`」的兜底逻辑，
-> 已随嵌套目录的修复一并删除：它会把「根目录指错 / split 写错 / 文件真缺失」三种故障
-> 静默变成「样本数变少」。现在缺失即抛异常，并提示去跑 `tools/audit_dataset.py`。
-
-复现（命令均在**仓库根目录**执行，`algo/` 下）：
 
 ```bash
-python plate_detection/tools/audit_dataset.py           # 全量审计，约 11 s
-python plate_detection/tools/make_splits.py             # 重建 train_mix / val_* / test_*
+python tools/audit_dataset.py           # 全量审计，约 11 s
+python tools/make_splits.py             # 重建 train_mix / val_* / test_*
 ```
 
 ## 目录结构
@@ -122,40 +97,31 @@ macOS / 无 NVIDIA 显卡：直接 `pip install torch torchvision`（默认 CPU 
 
 ## 用法
 
-**以下命令都在仓库根目录（`algo/`）执行**，脚本一律按 `plate_detection/xxx.py` 调用。
-
-`--config / --weights / --source / --out / --resume` 的相对路径会**先按当前目录解析，
-找不到再回落到 `plate_detection/`**，所以 `runs/smoke_fix/checkpoints/best.pth`（项目内短路径）
-和 `plate_detection/runs/smoke_fix/checkpoints/best.pth` 都能跑通，绝对路径不受影响。
-
-数据集需自行放在 `plate_detection/data/CCPD2019`（`splits/{train,val,test}.txt` + 各子目录图像），
-仓库里不含数据集；缺数据时各脚本会打印 `[FATAL] ... not found` 并返回退出码 2（不再抛 traceback）。
-
 ```bash
 # 1) 数据自查（会扫全部文件，约 15 分钟）
-python plate_detection/tools/check_dataset.py --sample 2000
+python tools/check_dataset.py --sample 2000
 
 # 2) 肉眼验收数据管线：画 GT 四边形 + 校正后的车牌 + 文本
-python plate_detection/tools/check_pipeline.py --n 8 --split val
+python tools/check_pipeline.py --n 8 --split val
 
 # 3) 训练（默认 12 epoch × 3125 step，8 GB 显存够用）
-python plate_detection/train.py --config configs/default.yaml
+python train.py --config configs/default.yaml
 
-# 冒烟：800 步，几分钟（产物写到 plate_detection/runs/smoke）
-python plate_detection/train.py --max-steps 800 --batch-size 32 --train-limit 8000 \
+# 冒烟：800 步，几分钟（产物写到 runs/smoke）
+python train.py --max-steps 800 --batch-size 32 --train-limit 8000 \
                 --lr 1.5e-3 --warmup-steps 80 --val-limit 512 \
                 --val-every 100 --val-batches 16 --output-dir runs/smoke
 
 # 断点续训（--output-dir 必须指回原目录，否则新日志/ckpt 会写进 configs 里的 runs/plate_net）
-python plate_detection/train.py --resume runs/smoke_fix/checkpoints/last.pth \
+python train.py --resume runs/smoke_fix/checkpoints/last.pth \
                 --output-dir runs/smoke_fix
 
 # 4) 评测（推荐权重 = 省份均衡重训版）
-python plate_detection/evaluate.py --weights runs/plate_bal/checkpoints/best.pth --split val --limit 5000
+python evaluate.py --weights runs/plate_bal/checkpoints/best.pth --split val --limit 5000
 
-# 5) 推理（单图或文件夹），结果画框存到 plate_detection/runs/pred
-python plate_detection/predict.py --weights runs/plate_bal/checkpoints/best.pth --source test.jpg
-python plate_detection/predict.py --weights runs/plate_bal/checkpoints/best.pth \
+# 5) 推理（单图或文件夹），结果画框存到 runs/pred
+python predict.py --weights runs/plate_bal/checkpoints/best.pth --source test.jpg
+python predict.py --weights runs/plate_bal/checkpoints/best.pth \
                                   --source some_dir/ --out runs/pred
 ```
 
@@ -164,38 +130,9 @@ python plate_detection/predict.py --weights runs/plate_bal/checkpoints/best.pth 
 全都找不到时退回 OpenCV 字体并打印告警（此时省份汉字会缺失），也可以显式指定：
 
 ```bash
-python plate_detection/predict.py --weights runs/plate_bal/checkpoints/best.pth \
+python predict.py --weights runs/plate_bal/checkpoints/best.pth \
     --source test.jpg --font "/System/Library/Fonts/Hiragino Sans GB.ttc"
 ```
-
-## 实测结果
-
-### 当前推荐权重：`runs/plate_bal/checkpoints/best.pth`（8 epoch，1.72 M 样本）
-
-三个测试集上的端到端整牌准确率（IoU≥0.7 计检出）：
-
-| split | 构成 | 整牌 acc | 非皖 acc | 皖误报率 | CER |
-|---|---|---:|---:|---:|---:|
-| `test_prov` | 31 省均衡诊断集 | **82.0%** | 82.2% | 1.9% | 4.3% |
-| `val_base` | ccpd_base 自然先验 | **98.2%** | 98.1% | 0.0% | 0.39% |
-| `test_mix` | 非 base 难例池 | **74.3%** | 78.6% | 2.3% | 7.0% |
-
-### 历史：800 步冒烟（`runs/smoke_fix`，仅见 25.6 k 样本 ≈ 0.26 epoch）
-
-val 512 张，IoU>0.7 计检出：
-
-| step | loss | IoU | 检出率 | 端到端准确率 | CER |
-|---|---|---|---|---|---|
-| 100 | 7.78 | 0.339 | 0.6% | 0.0% | 0.863 |
-| 200 | — | 0.825 | 92.0% | 0.0% | 0.732 |
-| 400 | — | 0.759 | 74.8% | 0.4% | 0.396 |
-| 600 | 2.57 | 0.822 | 94.5% | 30.3% | 0.148 |
-| 800 | 1.92 | 0.863 | 98.1% | **57.0%** | **0.078** |
-
-这个冒烟权重在省份均衡测试集上只有 **1.9%** 整牌准确率、**93%** 的非皖车牌被判成「皖」——
-它就是触发本次重训的那个基线，详见 `REPORT.md` §2.6。
-
-推理样例见 `runs/demo_out/`（含 tilt/rotate/fn 子集样本），`runs/sanity/` 可看数据管线验收图。
 
 ## 显存与速度（RTX 5060 Laptop 8 GB，实测）
 
@@ -205,23 +142,6 @@ val 512 张，IoU>0.7 计检出：
 | 32 | 140 | 229 | 1.27 GB |
 | 64 | 258 | 248 | 2.45 GB |
 
-结论：
-
-- **训练显存 ≈ 0.6 GB + 0.029 GB × batch**（bf16 混合精度，含参数/梯度/AdamW 两份状态）。
-  batch=32 约 1.3 GB；batch=64 约 2.5 GB。
-- 加上验证阶段（fp32、无 AMP）与 cuDNN autotune 的临时占用，进程峰值约 3 GB。
-  **8 GB 卡可以放心开 batch 64–96；4 GB 卡用 batch 16–32。**
-- 端到端训练 100 k 图 1 epoch ≈ 7.5 分钟（229 img/s），12 epoch ≈ 1.5 小时（单卡）。
-- 首次前向会花 ~18 s 做 cuDNN autotune / 内核编译，只在进程启动时发生一次。
-
-## 已知限制
-
-- 只支持单块车牌：没有 NMS，argmax 只取一个格子。多车牌场景需要改成 top-k + NMS。
-- **省份长尾已修正，但未根治**：官方 `train.txt` 里非皖只有 4,106 张（每省 137 张）。
-  `configs/balanced.yaml` 的逆频率重采样把非皖整牌准确率从 0.2% 提到 82.2%，剩下的错误集中在
-  「字形相近的省份汉字」（冀/闽、蒙/豫），属于分辨率问题而非分布问题。
-- 不含车牌颜色/类型（蓝牌/绿牌/黄牌）分类。
-- CTC 贪心解码，没有语言模型或约束解码；7/8 位车牌的位次约束可以进一步降 CER。
 
 ## 省份长尾修正（2026-11 重训）
 
@@ -229,29 +149,7 @@ val 512 张，IoU>0.7 计检出：
 修正版用另一套 split 与采样策略：
 
 ```bash
-python plate_detection/tools/make_splits.py          # 生成 train_mix / val_base / val_mix / test_prov / test_mix
-python plate_detection/train.py --config plate_detection/configs/balanced.yaml
-python plate_detection/tools/eval_suite.py --weights runs/plate_bal/checkpoints/best.pth --name new_bal
+python tools/make_splits.py          # 生成 train_mix / val_base / val_mix / test_prov / test_mix
+python train.py --config configs/balanced.yaml
+python tools/eval_suite.py --weights runs/plate_bal/checkpoints/best.pth --name new_bal
 ```
-
-关键点：**只把 blur/challenge/db/fn/rotate/tilt 加进训练是不够的**——这些子目录本身就有
-83–96% 是皖。真正起作用的是按省份逆频率重采样（`lpr/sampling.py`），把 batch 里皖的占比
-从 92.7% 压到 19.8%，同时给辅助子目录 1.4× 的重复因子。
-
-等预算消融（同数据池、同 12 000 步，只改 α）：
-
-| 设置 | `test_prov` 整牌 | 非皖 acc | 皖误报 | `val_base`（皖主导） |
-|---|---:|---:|---:|---:|
-| α=0（自然先验） | 32.9% | 30.0% | 30.6% | 97.5% |
-| α=0.7（重采样） | **67.4%** | **67.6%** | **4.0%** | 96.0% |
-
-也就是说分布效应本身是 2.0×，代价是皖主导集上 1.5 个点。数学推导、逐省/逐位分析与全部
-实验数据见 `REPORT.md`。
-
-## 参考
-
-- Xu et al., *Towards End-to-End License Plate Detection and Recognition: A Large Dataset and Baseline*, ECCV 2018（CCPD + RPnet，本项目的主要参照：共享特征、角点检测 + 透视校正 + 单次前向）
-  <https://github.com/detectRecog/CCPD>
-- Shi et al., *An End-to-End Trainable Neural Network for Image-based Sequence Recognition*（CRNN + CTC）
-- Zherzdev & Gruzdev, *LPRNet: License Plate Recognition via Deep Neural Networks*（轻量识别头设计思路）
-- Tian et al., *FCOS: Fully Convolutional One-Stage Object Detection*（本文的格子内正样本分配方式）
