@@ -22,11 +22,6 @@
 因此端到端联合训练（不需要 CPU 裁剪，也不需要两套模型）。
 
 
-```bash
-python tools/audit_dataset.py           # 全量审计，约 11 s
-python tools/make_splits.py             # 重建 train_mix / val_* / test_*
-```
-
 ## 预训练权重
 
 checkpoint 下载：[Google Drive](https://drive.google.com/file/d/1Y4A1yz6jKJmH5kXJx9Y8fOOVsxqNjelj/view?usp=sharing)
@@ -73,61 +68,31 @@ macOS / 无 NVIDIA 显卡：直接 `pip install torch torchvision`（默认 CPU 
 `predict.py` / `evaluate.py` 会自动回落到 CPU（不启用 MPS），功能一致、速度慢些。
 也可以直接用 `pip install -r plate_detection/requirements.txt`。
 
-## 用法
+## 复现
 
 ```bash
-# 1) 数据自查（会扫全部文件，约 15 分钟）
-python tools/check_dataset.py --sample 2000
+# 0) 数据审计（11 s）
+python tools/audit_dataset.py
 
-# 2) 肉眼验收数据管线：画 GT 四边形 + 校正后的车牌 + 文本
-python tools/check_pipeline.py --n 8 --split val
+# 1) 重建 split（含省份均衡诊断集）
+python tools/make_splits.py --per-province 150 --val-base 4000
 
-# 3) 训练（默认 12 epoch × 3125 step，8 GB 显存够用）
-python train.py --config configs/default.yaml
-
-# 冒烟：800 步，几分钟（产物写到 runs/smoke）
-python train.py --max-steps 800 --batch-size 32 --train-limit 8000 \
-                --lr 1.5e-3 --warmup-steps 80 --val-limit 512 \
-                --val-every 100 --val-batches 16 --output-dir runs/smoke
-
-# 断点续训（--output-dir 必须指回原目录，否则新日志/ckpt 会写进 configs 里的 runs/plate_net）
-python train.py --resume runs/smoke_fix/checkpoints/last.pth \
-                --output-dir runs/smoke_fix
-
-# 4) 评测（推荐权重 = 省份均衡重训版）
-python evaluate.py --weights runs/plate_bal/checkpoints/best.pth --split val --limit 5000
-
-# 5) 推理（单图或文件夹），结果画框存到 runs/pred
-python predict.py --weights runs/plate_bal/checkpoints/best.pth --source test.jpg
-python predict.py --weights runs/plate_bal/checkpoints/best.pth \
-                                  --source some_dir/ --out runs/pred
-```
-
-推理输出会在车牌四边形上方画绿底白字标签。车牌文本以中文省份开头，必须用 TrueType 中文字体渲染
-（OpenCV 自带的 Hershey 字体只有 ASCII），程序会按 Windows → macOS → Linux 顺序自动找系统字体，
-全都找不到时退回 OpenCV 字体并打印告警（此时省份汉字会缺失），也可以显式指定：
-
-```bash
-python predict.py --weights runs/plate_bal/checkpoints/best.pth \
-    --source test.jpg --font "/System/Library/Fonts/Hiragino Sans GB.ttc"
-```
-
-## 显存与速度（RTX 5060 Laptop 8 GB，实测）
-
-| batch | ms/step | img/s | 峰值显存（AMP 训练） |
-|---|---|---|---|
-| 16 | 73 | 218 | 0.68 GB |
-| 32 | 140 | 229 | 1.27 GB |
-| 64 | 258 | 248 | 2.45 GB |
-
-
-## 省份长尾修正（2026-11 重训）
-
-`train.py` 默认的 `configs/default.yaml` 仍复现历史行为（只在 `splits/train.txt` 上训练）。
-修正版用另一套 split 与采样策略：
-
-```bash
-python tools/make_splits.py          # 生成 train_mix / val_base / val_mix / test_prov / test_mix
+# 2) 重训（8 epoch × 215 179，约 2.3 h / RTX 5060 Laptop 8 GB）
 python train.py --config configs/balanced.yaml
-python tools/eval_suite.py --weights runs/plate_bal/checkpoints/best.pth --name new_bal
+
+# 3) 消融：同数据池、同步数，只把 α 改成 0（自然先验）
+python train.py --config configs/ablation_alpha0.yaml --max-steps 12000
+
+# 4) 评测（多 split + 逐省 + 事后先验校正扫描）
+python tools/eval_suite.py --weights runs/plate_bal/checkpoints/best.pth  --name new_bal --tau-sweep 0,0.5,1.0
+python tools/eval_suite.py --weights runs/smoke_fix/checkpoints/best.pth  --name old_smoke --tau-sweep 0,1.0
+python tools/pos_analysis.py --weights runs/plate_bal/checkpoints/best.pth --split test_prov --name new_bal
+python tools/pos_analysis.py --weights runs/smoke_fix/checkpoints/best.pth --split test_prov --name old_smoke
+
+# 5) 出图
+python tools/make_figures.py --new-eval runs/eval/new_bal.json
+python tools/make_ablation.py
+python tools/make_qualitative.py --old runs/smoke_fix/checkpoints/best.pth \
+                                 --new runs/plate_bal/checkpoints/best.pth \
+                                 --out runs/report_figs/fig8_qualitative.png
 ```
